@@ -108,6 +108,9 @@ pub enum HyParViewMessage {
         new_peer: PeerId,
         /// Remaining TTL for random walk
         ttl: usize,
+        /// Socket address of the new peer (for dialing)
+        #[serde(default)]
+        new_peer_addr: Option<std::net::SocketAddr>,
     },
     /// Neighbor request
     Neighbor {
@@ -982,7 +985,11 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
                 sender: fwd_sender,
                 new_peer,
                 ttl,
-            } => self.handle_forward_join(fwd_sender, new_peer, ttl).await,
+                new_peer_addr,
+            } => {
+                self.handle_forward_join(fwd_sender, new_peer, ttl, new_peer_addr)
+                    .await
+            }
             HyParViewMessage::Neighbor {
                 sender: nbr_sender,
                 priority,
@@ -1125,11 +1132,14 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
                 active.iter().filter(|&&p| p != new_peer).copied().collect();
             drop(active);
 
+            let new_peer_addr = self.get_peer_addr(&new_peer).await;
+
             for target in forward_targets {
                 let forward_msg = HyParViewMessage::ForwardJoin {
                     sender: self.local_peer_id,
                     new_peer,
                     ttl: ttl - 1,
+                    new_peer_addr,
                 };
                 // Best effort - don't fail the whole join if one forward fails
                 let _ = self.send_hyparview_message(target, &forward_msg).await;
@@ -1145,6 +1155,7 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
         _sender: PeerId,
         new_peer: PeerId,
         ttl: usize,
+        new_peer_addr: Option<std::net::SocketAddr>,
     ) -> Result<()> {
         // Track peer for network size estimation
         self.seen_peers
@@ -1160,9 +1171,26 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
         if ttl == 0 || active_count < self.config.active_degree {
             debug!(
                 new_peer = %new_peer,
+                new_peer_addr = ?new_peer_addr,
                 reason = if ttl == 0 { "TTL expired" } else { "active view has room" },
                 "HyParView: Accepting FORWARDJOIN"
             );
+
+            // If we have the new peer's address, try to dial before adding to active view
+            if let Some(addr) = new_peer_addr {
+                if let Err(e) = self.transport.dial(new_peer, addr).await {
+                    debug!(
+                        new_peer = %new_peer,
+                        addr = %addr,
+                        error = %e,
+                        "HyParView: Failed to dial new peer, adding to passive view instead"
+                    );
+                    self.add_to_passive(new_peer).await;
+                    self.store_peer_addr(new_peer, addr).await;
+                    return Ok(());
+                }
+                self.store_peer_addr(new_peer, addr).await;
+            }
 
             // Add to active and send NEIGHBOR request
             self.add_active(new_peer).await?;
@@ -1183,6 +1211,7 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
                     sender: self.local_peer_id,
                     new_peer,
                     ttl: ttl - 1,
+                    new_peer_addr,
                 };
                 self.send_hyparview_message(next, &forward_msg).await?;
             }
@@ -2789,6 +2818,13 @@ mod tests {
                 sender,
                 new_peer,
                 ttl: 3,
+                new_peer_addr: None,
+            }),
+            MembershipProtocolMessage::HyParView(HyParViewMessage::ForwardJoin {
+                sender,
+                new_peer,
+                ttl: 3,
+                new_peer_addr: Some("127.0.0.1:8080".parse().expect("valid addr")),
             }),
             MembershipProtocolMessage::HyParView(HyParViewMessage::Neighbor {
                 sender,
@@ -3707,5 +3743,156 @@ mod tests {
 
         let seen = membership.seen_peers.read().await;
         assert!(seen.contains_key(&sender));
+    }
+
+    // --- Mock transport for ForwardJoin dial tests ---
+
+    struct MockTransport {
+        local_id: PeerId,
+        dial_should_fail: std::sync::atomic::AtomicBool,
+        dial_called: std::sync::atomic::AtomicBool,
+    }
+
+    impl MockTransport {
+        fn new(local_id: PeerId) -> Self {
+            Self {
+                local_id,
+                dial_should_fail: std::sync::atomic::AtomicBool::new(false),
+                dial_called: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn set_dial_fails(&self, fails: bool) {
+            self.dial_should_fail
+                .store(fails, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn was_dial_called(&self) -> bool {
+            self.dial_called
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GossipTransport for MockTransport {
+        async fn dial(&self, _peer: PeerId, _addr: SocketAddr) -> Result<()> {
+            self.dial_called
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if self
+                .dial_should_fail
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(anyhow!("mock dial failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn dial_bootstrap(&self, _addr: SocketAddr) -> Result<PeerId> {
+            Err(anyhow!("not implemented"))
+        }
+
+        async fn listen(&self, _bind: SocketAddr) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn send_to_peer(
+            &self,
+            _peer: PeerId,
+            _stream_type: GossipStreamType,
+            _data: bytes::Bytes,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn receive_message(&self) -> Result<(PeerId, GossipStreamType, bytes::Bytes)> {
+            Err(anyhow!("not implemented"))
+        }
+
+        fn local_peer_id(&self) -> PeerId {
+            self.local_id
+        }
+    }
+
+    fn mock_membership(
+        transport: Arc<MockTransport>,
+    ) -> HyParViewMembership<MockTransport> {
+        HyParViewMembership::new(
+            transport.local_peer_id(),
+            MembershipConfig::default(),
+            transport,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_forward_join_with_address_dials_and_adds_to_active() {
+        let transport = Arc::new(MockTransport::new(PeerId::new([0u8; 32])));
+        let membership = mock_membership(transport.clone());
+        let new_peer = PeerId::new([2u8; 32]);
+        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        membership
+            .handle_forward_join(PeerId::new([1u8; 32]), new_peer, 0, Some(addr))
+            .await
+            .unwrap();
+
+        assert!(transport.was_dial_called(), "dial should have been called");
+        assert!(
+            membership.active_view().contains(&new_peer),
+            "peer should be in active view after successful dial"
+        );
+        assert!(
+            !membership.passive_view().contains(&new_peer),
+            "peer should not be in passive view"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forward_join_without_address_adds_to_active() {
+        let transport = Arc::new(MockTransport::new(PeerId::new([0u8; 32])));
+        let membership = mock_membership(transport.clone());
+        let new_peer = PeerId::new([2u8; 32]);
+
+        membership
+            .handle_forward_join(PeerId::new([1u8; 32]), new_peer, 0, None)
+            .await
+            .unwrap();
+
+        assert!(
+            !transport.was_dial_called(),
+            "dial should not be called without address"
+        );
+        assert!(
+            membership.active_view().contains(&new_peer),
+            "peer should be in active view"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forward_join_dial_failure_falls_back_to_passive() {
+        let transport = Arc::new(MockTransport::new(PeerId::new([0u8; 32])));
+        transport.set_dial_fails(true);
+        let membership = mock_membership(transport.clone());
+        let new_peer = PeerId::new([2u8; 32]);
+        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        membership
+            .handle_forward_join(PeerId::new([1u8; 32]), new_peer, 0, Some(addr))
+            .await
+            .unwrap();
+
+        assert!(transport.was_dial_called(), "dial should have been called");
+        assert!(
+            !membership.active_view().contains(&new_peer),
+            "peer should not be in active view after dial failure"
+        );
+        assert!(
+            membership.passive_view().contains(&new_peer),
+            "peer should be in passive view as fallback"
+        );
     }
 }

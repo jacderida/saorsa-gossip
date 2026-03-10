@@ -302,6 +302,11 @@ pub trait GossipTransport: Send + Sync {
 
     /// Returns the local peer ID for this transport.
     fn local_peer_id(&self) -> PeerId;
+
+    /// Returns the socket address of a connected peer, if known.
+    fn peer_addr(&self, _peer: PeerId) -> Option<SocketAddr> {
+        None
+    }
 }
 
 // Blanket implementation for Arc<T> to allow calling trait methods through Arc
@@ -338,6 +343,10 @@ impl<T: GossipTransport + ?Sized> GossipTransport for std::sync::Arc<T> {
 
     fn local_peer_id(&self) -> PeerId {
         (**self).local_peer_id()
+    }
+
+    fn peer_addr(&self, peer: PeerId) -> Option<SocketAddr> {
+        (**self).peer_addr(peer)
     }
 }
 
